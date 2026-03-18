@@ -154,7 +154,7 @@ app.listen(config.port, () => {
     
     // Tools 配置摘要
     const toolsCfg = config.tools;
-    let toolsInfo = 'default (compact, desc≤50)';
+    let toolsInfo = 'default (full, desc=full)';
     if (toolsCfg) {
         const parts: string[] = [];
         parts.push(`schema=${toolsCfg.schemaMode}`);

@@ -157,8 +157,8 @@ function buildToolInstructions(
 
     // 根据是否有交互工具，调整行为规则
     const behaviorRules = hasCommunicationTool
-        ? `When performing actions, always include the structured block. For independent actions, include multiple blocks. For dependent actions (where one result feeds into the next), wait for each result. When you have nothing to execute or need to ask the user something, use the communication actions (attempt_completion, ask_followup_question). Do not run empty or meaningless commands.`
-        : `Include the structured block when performing actions. For independent actions, include multiple blocks. For dependent actions, wait for each result. Keep explanatory text brief. If you have completed the task or have nothing to execute, respond in plain text without any structured block. Do not run meaningless commands like "echo ready".`;
+        ? `When performing actions, always include the structured block. For independent actions, include multiple blocks. For dependent actions (where one result feeds into the next), wait for each result. When you have nothing to execute or need to ask the user something, use the communication actions (attempt_completion, ask_followup_question). Do not run empty or meaningless commands. Each response must be maximally efficient: omit preamble and planning text when the next step is clear—go straight to the action block.`
+        : `Include the structured block when performing actions. For independent actions, include multiple blocks. For dependent actions, wait for each result. Keep explanatory text brief. If you have completed the task or have nothing to execute, respond in plain text without any structured block. Do not run meaningless commands like "echo ready". Each response must be maximally efficient: omit preamble and planning text when the next step is clear—go straight to the action block.`;
 
     return `You are operating within an IDE environment with access to the following actions. To invoke an action, include it in your response using this structured format:
 
@@ -219,6 +219,9 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     // ★ 计费头清除：x-anthropic-billing-header 会被模型判定为恶意伪造并触发注入警告
     if (combinedSystem) {
         combinedSystem = combinedSystem.replace(/^x-anthropic-billing-header[^\n]*$/gim, '');
+        // ★ Claude Code 身份声明清除：模型看到 "You are Claude Code" 会认为是 prompt injection
+        combinedSystem = combinedSystem.replace(/^You are Claude Code[^\n]*$/gim, '');
+        combinedSystem = combinedSystem.replace(/^You are Claude,\s+Anthropic's[^\n]*$/gim, '');
         combinedSystem = combinedSystem.replace(/\n{3,}/g, '\n\n').trim();
     }
     // ★ Thinking 提示注入：根据是否有工具选择不同的注入位置
@@ -399,13 +402,26 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         }
     }
 
+    // ★ 历史消息条数硬限制
+    // 超出 max_history_messages 时，删除最早的消息（保留 few-shot 示例）
+    const maxHistoryMessages = config.maxHistoryMessages;
+    if (maxHistoryMessages >= 0) {
+        const fewShotOffset = hasTools ? 2 : 0; // 工具模式有2条 few-shot 消息需跳过
+        const userMessages = messages.length - fewShotOffset;
+        if (userMessages > maxHistoryMessages) {
+            const toRemove = userMessages - maxHistoryMessages;
+            messages.splice(fewShotOffset, toRemove);
+            console.log(`[Converter] 历史消息裁剪: ${userMessages} → ${maxHistoryMessages} 条 (移除了最早的 ${toRemove} 条)`);
+        }
+    }
+
     // ★ 渐进式历史压缩（智能压缩，不破坏结构）
     // 可通过 config.yaml 的 compression 配置控制开关和级别
     // 策略：保留最近 KEEP_RECENT 条消息完整，对早期消息进行结构感知压缩
     // - 包含 json action 块的 assistant 消息 → 摘要替代（防止截断 JSON 导致解析错误）
     // - 工具结果消息 → 头尾保留（错误信息经常在末尾）
     // - 普通文本 → 在自然边界处截断
-    const compressionConfig = config.compression ?? { enabled: true, level: 2 as const, keepRecent: 6, earlyMsgMaxChars: 2000 };
+    const compressionConfig = config.compression ?? { enabled: false, level: 1 as const, keepRecent: 10, earlyMsgMaxChars: 4000 };
     if (compressionConfig.enabled) {
         // ★ 压缩级别参数映射：
         // Level 1（轻度）: 保留更多消息和更多字符
@@ -561,7 +577,7 @@ function extractToolResultNatural(msg: AnthropicMessage): string {
     }
 
     const result = parts.join('\n\n');
-    return `${result}\n\nBased on the output above, continue working on the task described in the conversation context. Do NOT stop or ask what to do — review the prior context and proceed with the next appropriate action using the structured format.`;
+    return `${result}\n\nContinue with the next action.`;
 }
 
 /**

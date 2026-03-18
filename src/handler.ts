@@ -20,7 +20,7 @@ import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converte
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
-import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
+import { createIncrementalTextStreamer, hasLeadingThinking, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -693,12 +693,12 @@ export async function autoContinueCursorToolResponseStream(
     hasTools: boolean,
 ): Promise<string> {
     let fullResponse = initialResponse;
-    const MAX_AUTO_CONTINUE = 3;
+    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
-    const originalMessages = [...cursorReq.messages];
 
-    while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+
+    while (MAX_AUTO_CONTINUE > 0 && shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
 
         const anchorLength = Math.min(300, fullResponse.length);
@@ -711,12 +711,18 @@ export async function autoContinueCursorToolResponseStream(
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
+        const assistantContext = fullResponse.length > 2000
+            ? '...\n' + fullResponse.slice(-2000)
+            : fullResponse;
+
         const continuationReq: CursorChatRequest = {
             ...cursorReq,
             messages: [
-                ...originalMessages,
+                // ★ 续写优化：丢弃所有工具定义和历史消息，只保留续写上下文
+                // 模型已经知道在写什么（从 assistantContext 可以推断），不需要工具 Schema
+                // 这样大幅减少输入体积，给输出留更多空间，续写更快
                 {
-                    parts: [{ type: 'text', text: fullResponse }],
+                    parts: [{ type: 'text', text: assistantContext }],
                     id: uuidv4(),
                     role: 'assistant',
                 },
@@ -760,12 +766,11 @@ export async function autoContinueCursorToolResponseFull(
     hasTools: boolean,
 ): Promise<string> {
     let fullText = initialText;
-    const MAX_AUTO_CONTINUE = 3;
+    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
-    const originalMessages = [...cursorReq.messages];
 
-    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+    while (MAX_AUTO_CONTINUE > 0 && shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
 
         const anchorLength = Math.min(300, fullText.length);
@@ -778,12 +783,16 @@ export async function autoContinueCursorToolResponseFull(
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
+        const assistantContext = fullText.length > 2000
+            ? '...\n' + fullText.slice(-2000)
+            : fullText;
+
         const continuationReq: CursorChatRequest = {
             ...cursorReq,
             messages: [
-                ...originalMessages,
+                // ★ 续写优化：丢弃所有工具定义和历史消息
                 {
-                    parts: [{ type: 'text', text: fullText }],
+                    parts: [{ type: 'text', text: assistantContext }],
                     id: uuidv4(),
                     role: 'assistant',
                 },
@@ -816,7 +825,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 }
 
 // ==================== 重试辅助 ====================
-export const MAX_REFUSAL_RETRIES = 2;
+export const MAX_REFUSAL_RETRIES = 1;
 
 /**
  * 当检测到拒绝时，用 IDE 上下文重新包装原始请求体并重试
@@ -1063,7 +1072,7 @@ async function handleDirectTextStream(
         hasTools: false,
     });
 
-    if (!finalThinkingContent && finalRawResponse.includes('<thinking>')) {
+    if (!finalThinkingContent && hasLeadingThinking(finalRawResponse)) {
         const { thinkingContent: extracted } = extractThinking(finalRawResponse);
         if (extracted) {
             finalThinkingContent = extracted;
@@ -1163,18 +1172,41 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
-    const executeStream = async () => {
+    const executeStream = async (detectRefusalEarly = false, onTextDelta?: (delta: string) => void): Promise<{ earlyAborted: boolean }> => {
         fullResponse = '';
         const apiStart = Date.now();
         let firstChunk = true;
+        let earlyAborted = false;
         log.startPhase('send', '发送到 Cursor');
-        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
-            if (event.type !== 'text-delta' || !event.delta) return;
-            if (firstChunk) { log.recordTTFT(); log.endPhase(); log.startPhase('response', '接收响应'); firstChunk = false; }
-            fullResponse += event.delta;
-        });
+
+        // ★ 早期中止支持：检测到拒绝后立即中断流，不等完整响应
+        const abortController = detectRefusalEarly ? new AbortController() : undefined;
+
+        try {
+            await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                if (event.type !== 'text-delta' || !event.delta) return;
+                if (firstChunk) { log.recordTTFT(); log.endPhase(); log.startPhase('response', '接收响应'); firstChunk = false; }
+                fullResponse += event.delta;
+                onTextDelta?.(event.delta);
+
+                // ★ 早期拒绝检测：前 300 字符即可判断
+                if (detectRefusalEarly && !earlyAborted && fullResponse.length >= 200 && fullResponse.length < 600) {
+                    const preview = fullResponse.substring(0, 400);
+                    if (isRefusal(preview) && !hasToolCalls(preview)) {
+                        earlyAborted = true;
+                        log.info('Handler', 'response', `前${fullResponse.length}字符检测到拒绝，提前中止流`, { preview: preview.substring(0, 150) });
+                        abortController?.abort();
+                    }
+                }
+            }, abortController?.signal);
+        } catch (err) {
+            // 仅在非主动中止时抛出
+            if (!earlyAborted) throw err;
+        }
+
         log.endPhase();
         log.recordCursorApiTime(apiStart);
+        return { earlyAborted };
     };
 
     try {
@@ -1187,7 +1219,8 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             return;
         }
 
-        // 工具模式：创建 keepalive（无工具路径已在 handleDirectTextStream 内部处理）
+        // ★ 工具模式：混合流式 — 文本增量推送 + 工具块缓冲
+        // 用户体验优化：工具调用前的文字立即逐字流式，不再等全部生成完毕
         keepaliveInterval = setInterval(() => {
             try {
                 res.write(': keepalive\n\n');
@@ -1196,7 +1229,127 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             } catch { /* connection already closed, ignore */ }
         }, 15000);
 
-        await executeStream();
+        // --- 混合流式状态 ---
+        const hybridStreamer = createIncrementalTextStreamer({
+            warmupChars: 300,   // ★ 与拒绝检测窗口对齐：前 300 chars 不释放，等拒绝检测通过后再流
+            transform: sanitizeResponse,
+            isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+        });
+        let toolMarkerDetected = false;
+        let pendingText = '';                           // 边界检测缓冲区
+        let hybridThinkingContent = '';
+        let hybridLeadingBuffer = '';
+        let hybridLeadingResolved = false;
+        const TOOL_MARKER = '```json action';
+        const MARKER_LOOKBACK = TOOL_MARKER.length + 2; // +2 for newline safety
+        let hybridTextSent = false;                     // 是否已经向客户端发过文字
+
+        const hybridState = { blockIndex, textBlockStarted, thinkingEmitted: thinkingBlockEmitted };
+
+        const pushToStreamer = (text: string): void => {
+            if (!text || toolMarkerDetected) return;
+
+            pendingText += text;
+            const idx = pendingText.indexOf(TOOL_MARKER);
+            if (idx >= 0) {
+                // 工具标记出现 → flush 标记前的文字，切换到缓冲模式
+                const before = pendingText.substring(0, idx);
+                if (before) {
+                    const d = hybridStreamer.push(before);
+                    if (d) {
+                        if (clientRequestedThinking && hybridThinkingContent && !hybridState.thinkingEmitted) {
+                            emitAnthropicThinkingBlock(res, hybridState, hybridThinkingContent);
+                        }
+                        writeAnthropicTextDelta(res, hybridState, d);
+                        hybridTextSent = true;
+                    }
+                }
+                toolMarkerDetected = true;
+                pendingText = '';
+                return;
+            }
+
+            // 安全刷出：保留末尾 MARKER_LOOKBACK 长度防止标记被截断
+            const safeEnd = pendingText.length - MARKER_LOOKBACK;
+            if (safeEnd > 0) {
+                const safe = pendingText.substring(0, safeEnd);
+                pendingText = pendingText.substring(safeEnd);
+                const d = hybridStreamer.push(safe);
+                if (d) {
+                    if (clientRequestedThinking && hybridThinkingContent && !hybridState.thinkingEmitted) {
+                        emitAnthropicThinkingBlock(res, hybridState, hybridThinkingContent);
+                    }
+                    writeAnthropicTextDelta(res, hybridState, d);
+                    hybridTextSent = true;
+                }
+            }
+        };
+
+        const processHybridDelta = (delta: string): void => {
+            // 前导 thinking 检测（与 handleDirectTextStream 完全一致）
+            if (!hybridLeadingResolved) {
+                hybridLeadingBuffer += delta;
+                const split = splitLeadingThinkingBlocks(hybridLeadingBuffer);
+                if (split.startedWithThinking) {
+                    if (!split.complete) return;
+                    hybridThinkingContent = split.thinkingContent;
+                    hybridLeadingResolved = true;
+                    hybridLeadingBuffer = '';
+                    pushToStreamer(split.remainder);
+                    return;
+                }
+                if (hybridLeadingBuffer.trimStart().length < THINKING_OPEN.length) return;
+                hybridLeadingResolved = true;
+                const buffered = hybridLeadingBuffer;
+                hybridLeadingBuffer = '';
+                pushToStreamer(buffered);
+                return;
+            }
+            pushToStreamer(delta);
+        };
+
+        // 执行第一次请求（带混合流式回调）
+        await executeStream(true, processHybridDelta);
+
+        // 流结束：flush 残留的 leading buffer
+        if (!hybridLeadingResolved && hybridLeadingBuffer) {
+            hybridLeadingResolved = true;
+            const split = splitLeadingThinkingBlocks(hybridLeadingBuffer);
+            if (split.startedWithThinking && split.complete) {
+                hybridThinkingContent = split.thinkingContent;
+                pushToStreamer(split.remainder);
+            } else {
+                pushToStreamer(hybridLeadingBuffer);
+            }
+        }
+        // flush 残留的 pendingText（没有检测到工具标记）
+        if (pendingText && !toolMarkerDetected) {
+            const d = hybridStreamer.push(pendingText);
+            if (d) {
+                if (clientRequestedThinking && hybridThinkingContent && !hybridState.thinkingEmitted) {
+                    emitAnthropicThinkingBlock(res, hybridState, hybridThinkingContent);
+                }
+                writeAnthropicTextDelta(res, hybridState, d);
+                hybridTextSent = true;
+            }
+            pendingText = '';
+        }
+        // finalize streamer 残留文本
+        const hybridRemaining = hybridStreamer.finish();
+        if (hybridRemaining) {
+            if (clientRequestedThinking && hybridThinkingContent && !hybridState.thinkingEmitted) {
+                emitAnthropicThinkingBlock(res, hybridState, hybridThinkingContent);
+            }
+            writeAnthropicTextDelta(res, hybridState, hybridRemaining);
+            hybridTextSent = true;
+        }
+        // 同步混合流式状态回主变量
+        blockIndex = hybridState.blockIndex;
+        textBlockStarted = hybridState.textBlockStarted;
+        thinkingBlockEmitted = hybridState.thinkingEmitted;
+        // ★ 混合流式标记：记录已通过增量流发送给客户端的状态
+        // 后续 SSE 输出阶段根据此标记跳过已发送的文字
+        const hybridAlreadySentText = hybridTextSent;
 
         log.recordRawResponse(fullResponse);
         log.info('Handler', 'response', `原始响应: ${fullResponse.length} chars`, {
@@ -1205,12 +1358,12 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         });
 
         // ★ Thinking 提取（在拒绝检测之前，防止 thinking 内容触发 isRefusal 误判）
-        // 始终剥离 thinking 标签，避免泄漏到最终文本中
-        let thinkingContent = '';
-        if (fullResponse.includes('<thinking>')) {
+        // 混合流式阶段可能已经提取了 thinking，优先使用
+        let thinkingContent = hybridThinkingContent || '';
+        if (hasLeadingThinking(fullResponse)) {
             const { thinkingContent: extracted, strippedText } = extractThinking(fullResponse);
             if (extracted) {
-                thinkingContent = extracted;
+                if (!thinkingContent) thinkingContent = extracted;
                 fullResponse = strippedText;
                 log.recordThinking(thinkingContent);
                 log.updateSummary({ thinkingChars: thinkingContent.length });
@@ -1223,8 +1376,10 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         }
 
         // 拒绝检测 + 自动重试
-        // fullResponse 已在上方剥离 thinking 标签，可直接用于拒绝检测
+        // ★ 混合流式保护：如果已经向客户端发送了文字，不能重试（会导致内容重复）
+        // IncrementalTextStreamer 的 isBlockedPrefix 机制保证拒绝一定在发送任何文字之前被检测到
         const shouldRetryRefusal = () => {
+            if (hybridTextSent) return false;  // 已发文字，不可重试
             if (!isRefusal(fullResponse)) return false;
             if (hasTools && hasToolCalls(fullResponse)) return false;
             return true;
@@ -1236,9 +1391,9 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
-            await executeStream();
+            await executeStream(true);  // 重试不传回调（纯缓冲模式）
             // 重试后也需要剥离 thinking 标签
-            if (fullResponse.includes('<thinking>')) {
+            if (hasLeadingThinking(fullResponse)) {
                 const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullResponse);
                 if (retryThinking) {
                     thinkingContent = retryThinking;
@@ -1279,14 +1434,12 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         // 流完成后，处理完整响应
         // ★ 内部截断续写：如果模型输出过长被截断（常见于写大文件），Proxy 内部分段续写，然后拼接成完整响应
         // 这样可以确保工具调用（如 Write）不会横跨两次 API 响应而退化为纯文本
-        const MAX_AUTO_CONTINUE = 3;
+        const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue ?? 0;
         let continueCount = 0;
         let consecutiveSmallAdds = 0; // 连续小增量计数
+
         
-        // 保存原始请求的消息快照（不含续写追加的消息）
-        const originalMessages = [...activeCursorReq.messages];
-        
-        while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+        while (MAX_AUTO_CONTINUE > 0 && shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
             continueCount++;
             const prevLength = fullResponse.length;
             log.warn('Handler', 'continuation', `内部检测到截断 (${fullResponse.length} chars)，隐式续写 (第${continueCount}次)`);
@@ -1296,8 +1449,8 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             const anchorLength = Math.min(300, fullResponse.length);
             const anchorText = fullResponse.slice(-anchorLength);
             
-            // 构造续写请求：原始消息 + 截断的 assistant 回复 + user 续写引导
-            // 每次重建而非累积，防止上下文膨胀
+            // 构造续写请求：原始消息 + 截断的 assistant 回复(仅末尾) + user 续写引导
+            // ★ 只发最后 2000 字符作为 assistant 上下文，大幅减小请求体
             const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
 
 \`\`\`
@@ -1306,12 +1459,16 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
+            const assistantContext = fullResponse.length > 2000
+                ? '...\n' + fullResponse.slice(-2000)
+                : fullResponse;
+
             activeCursorReq = {
                 ...activeCursorReq,
                 messages: [
-                    ...originalMessages,
+                    // ★ 续写优化：丢弃所有工具定义和历史消息
                     {
-                        parts: [{ type: 'text', text: fullResponse }],
+                        parts: [{ type: 'text', text: assistantContext }],
                         id: uuidv4(),
                         role: 'assistant',
                     },
@@ -1373,10 +1530,10 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             log.warn('Handler', 'truncation', `${MAX_AUTO_CONTINUE}次续写后仍截断 (${fullResponse.length} chars) → stop_reason=max_tokens`);
         }
 
-        // ★ Thinking 块发送：仅 GUI 插件（enabled）才发 thinking content block
-        // Claude Code（adaptive）需要密码学 signature 验证，无法伪造，所以保留标签在正文中
+        // ★ Thinking 块发送：仅在混合流式未发送 thinking 时才在此发送
+        // 混合流式阶段已通过 emitAnthropicThinkingBlock 发送过的不重复发
         log.startPhase('stream', 'SSE 输出');
-        if (clientRequestedThinking && thinkingContent) {
+        if (clientRequestedThinking && thinkingContent && !thinkingBlockEmitted) {
             writeSSE(res, 'content_block_start', {
                 type: 'content_block_start', index: blockIndex,
                 content_block: { type: 'thinking', thinking: '' },
@@ -1392,6 +1549,32 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         }
 
         if (hasTools) {
+            // ★ 截断保护：如果响应被截断，不要解析不完整的工具调用
+            // 直接作为纯文本返回 max_tokens，让客户端自行处理续写
+            if (stopReason === 'max_tokens') {
+                log.info('Handler', 'truncation', '响应截断，跳过工具解析，作为纯文本返回 max_tokens');
+                // 去掉不完整的 ```json action 块
+                const incompleteToolIdx = fullResponse.lastIndexOf('```json action');
+                const textOnly = incompleteToolIdx >= 0 ? fullResponse.substring(0, incompleteToolIdx).trimEnd() : fullResponse;
+                
+                // 发送纯文本
+                if (!hybridAlreadySentText) {
+                    const unsentText = textOnly.substring(sentText.length);
+                    if (unsentText) {
+                        if (!textBlockStarted) {
+                            writeSSE(res, 'content_block_start', {
+                                type: 'content_block_start', index: blockIndex,
+                                content_block: { type: 'text', text: '' },
+                            });
+                            textBlockStarted = true;
+                        }
+                        writeSSE(res, 'content_block_delta', {
+                            type: 'content_block_delta', index: blockIndex,
+                            delta: { type: 'text_delta', text: unsentText },
+                        });
+                    }
+                }
+            } else {
             let { toolCalls, cleanText } = parseToolCalls(fullResponse);
 
             // ★ tool_choice=any 强制重试：如果模型没有输出任何工具调用块，追加强制消息重试
@@ -1441,20 +1624,23 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 }
 
                 // Any clean text is sent as a single block before the tool blocks
-                const unsentCleanText = cleanText.substring(sentText.length).trim();
+                // ★ 如果混合流式已经发送了文字，跳过重复发送
+                if (!hybridAlreadySentText) {
+                    const unsentCleanText = cleanText.substring(sentText.length).trim();
 
-                if (unsentCleanText) {
-                    if (!textBlockStarted) {
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'text', text: '' },
+                    if (unsentCleanText) {
+                        if (!textBlockStarted) {
+                            writeSSE(res, 'content_block_start', {
+                                type: 'content_block_start', index: blockIndex,
+                                content_block: { type: 'text', text: '' },
+                            });
+                            textBlockStarted = true;
+                        }
+                        writeSSE(res, 'content_block_delta', {
+                            type: 'content_block_delta', index: blockIndex,
+                            delta: { type: 'text_delta', text: (sentText && !sentText.endsWith('\n') ? '\n' : '') + unsentCleanText }
                         });
-                        textBlockStarted = true;
                     }
-                    writeSSE(res, 'content_block_delta', {
-                        type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: (sentText && !sentText.endsWith('\n') ? '\n' : '') + unsentCleanText }
-                    });
                 }
 
                 if (textBlockStarted) {
@@ -1492,34 +1678,38 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             } else {
                 // False alarm! The tool triggers were just normal text. 
                 // We must send the remaining unsent fullResponse.
-                let textToSend = fullResponse;
+                // ★ 如果混合流式已发送部分文字，只发送未发送的部分
+                if (!hybridAlreadySentText) {
+                    let textToSend = fullResponse;
 
-                // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
-                // fullResponse 已被剥离 thinking 标签
-                const isShortResponse = fullResponse.trim().length < 500;
-                const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
-                const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
+                    // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
+                    // fullResponse 已被剥离 thinking 标签
+                    const isShortResponse = fullResponse.trim().length < 500;
+                    const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
+                    const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
 
-                if (isActualRefusal) {
-                    log.info('Handler', 'sanitize', `抑制无工具的完整拒绝响应`, { preview: fullResponse.substring(0, 200) });
-                    textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
-                }
-
-                const unsentText = textToSend.substring(sentText.length);
-                if (unsentText) {
-                    if (!textBlockStarted) {
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'text', text: '' },
-                        });
-                        textBlockStarted = true;
+                    if (isActualRefusal) {
+                        log.info('Handler', 'sanitize', `抑制无工具的完整拒绝响应`, { preview: fullResponse.substring(0, 200) });
+                        textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
                     }
-                    writeSSE(res, 'content_block_delta', {
-                        type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: unsentText },
-                    });
+
+                    const unsentText = textToSend.substring(sentText.length);
+                    if (unsentText) {
+                        if (!textBlockStarted) {
+                            writeSSE(res, 'content_block_start', {
+                                type: 'content_block_start', index: blockIndex,
+                                content_block: { type: 'text', text: '' },
+                            });
+                            textBlockStarted = true;
+                        }
+                        writeSSE(res, 'content_block_delta', {
+                            type: 'content_block_delta', index: blockIndex,
+                            delta: { type: 'text_delta', text: unsentText },
+                        });
+                    }
                 }
             }
+            } // end else (non-truncated tool parsing)
         } else {
             // 无工具模式 — 缓冲后统一发送（已经过拒绝检测+重试）
             // 最后一道防线：清洗所有 Cursor 身份引用
@@ -1608,7 +1798,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     // ★ Thinking 提取（在拒绝检测之前）
     // 始终剥离 thinking 标签，避免泄漏到最终文本中
     let thinkingContent = '';
-    if (fullText.includes('<thinking>')) {
+    if (hasLeadingThinking(fullText)) {
         const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
         if (extracted) {
             thinkingContent = extracted;
@@ -1636,7 +1826,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             activeCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(activeCursorReq);
             // 重试后也需要剥离 thinking 标签
-            if (fullText.includes('<thinking>')) {
+            if (hasLeadingThinking(fullText)) {
                 const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
                 if (retryThinking) {
                     thinkingContent = retryThinking;
@@ -1671,12 +1861,11 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     // ★ 内部截断续写（与流式路径对齐）
     // Claude CLI 使用非流式模式时，写大文件最容易被截断
     // 在 proxy 内部完成续写，确保工具调用参数完整
-    const MAX_AUTO_CONTINUE = 3;
+    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
     let continueCount = 0;
     let consecutiveSmallAdds = 0; // 连续小增量计数
-    const originalMessages = [...activeCursorReq.messages];
 
-    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+    while (MAX_AUTO_CONTINUE > 0 && shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
         const prevLength = fullText.length;
         log.warn('Handler', 'continuation', `非流式检测到截断 (${fullText.length} chars)，隐式续写 (第${continueCount}次)`);
@@ -1696,9 +1885,9 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         const continuationReq: CursorChatRequest = {
             ...activeCursorReq,
             messages: [
-                ...originalMessages,
+                // ★ 续写优化：丢弃所有工具定义和历史消息
                 {
-                    parts: [{ type: 'text', text: fullText }],
+                    parts: [{ type: 'text', text: fullText.length > 2000 ? '...\n' + fullText.slice(-2000) : fullText }],
                     id: uuidv4(),
                     role: 'assistant',
                 },

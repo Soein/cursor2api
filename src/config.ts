@@ -12,6 +12,8 @@ export function getConfig(): AppConfig {
         port: 3010,
         timeout: 120,
         cursorModel: 'anthropic/claude-sonnet-4.6',
+        maxAutoContinue: 0,
+        maxHistoryMessages: -1,
         fingerprint: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
         },
@@ -26,6 +28,8 @@ export function getConfig(): AppConfig {
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
+            if (typeof yaml.max_auto_continue === 'number') config.maxAutoContinue = yaml.max_auto_continue;
+            if (typeof yaml.max_history_messages === 'number') config.maxHistoryMessages = yaml.max_history_messages;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
             }
@@ -50,9 +54,9 @@ export function getConfig(): AppConfig {
                 const c = yaml.compression;
                 config.compression = {
                     enabled: c.enabled !== false, // 默认启用
-                    level: [1, 2, 3].includes(c.level) ? c.level : 2,
-                    keepRecent: typeof c.keep_recent === 'number' ? c.keep_recent : 6,
-                    earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : 2000,
+                    level: [1, 2, 3].includes(c.level) ? c.level : 1,
+                    keepRecent: typeof c.keep_recent === 'number' ? c.keep_recent : 10,
+                    earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : 4000,
                 };
             }
             // ★ Thinking 开关（最高优先级）
@@ -74,8 +78,8 @@ export function getConfig(): AppConfig {
                 const t = yaml.tools;
                 const validModes = ['compact', 'full', 'names_only'];
                 config.tools = {
-                    schemaMode: validModes.includes(t.schema_mode) ? t.schema_mode : 'compact',
-                    descriptionMaxLength: typeof t.description_max_length === 'number' ? t.description_max_length : 50,
+                    schemaMode: validModes.includes(t.schema_mode) ? t.schema_mode : 'full',
+                    descriptionMaxLength: typeof t.description_max_length === 'number' ? t.description_max_length : 0,
                     includeOnly: Array.isArray(t.include_only) ? t.include_only.map(String) : undefined,
                     exclude: Array.isArray(t.exclude) ? t.exclude.map(String) : undefined,
                 };
@@ -90,16 +94,18 @@ export function getConfig(): AppConfig {
     if (process.env.TIMEOUT) config.timeout = parseInt(process.env.TIMEOUT);
     if (process.env.PROXY) config.proxy = process.env.PROXY;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
+    if (process.env.MAX_AUTO_CONTINUE !== undefined) config.maxAutoContinue = parseInt(process.env.MAX_AUTO_CONTINUE);
+    if (process.env.MAX_HISTORY_MESSAGES !== undefined) config.maxHistoryMessages = parseInt(process.env.MAX_HISTORY_MESSAGES);
     if (process.env.AUTH_TOKEN) {
         config.authTokens = process.env.AUTH_TOKEN.split(',').map(s => s.trim()).filter(Boolean);
     }
     // 压缩环境变量覆盖
     if (process.env.COMPRESSION_ENABLED !== undefined) {
-        if (!config.compression) config.compression = { enabled: true, level: 2, keepRecent: 6, earlyMsgMaxChars: 2000 };
+        if (!config.compression) config.compression = { enabled: false, level: 1, keepRecent: 10, earlyMsgMaxChars: 4000 };
         config.compression.enabled = process.env.COMPRESSION_ENABLED !== 'false' && process.env.COMPRESSION_ENABLED !== '0';
     }
     if (process.env.COMPRESSION_LEVEL) {
-        if (!config.compression) config.compression = { enabled: true, level: 2, keepRecent: 6, earlyMsgMaxChars: 2000 };
+        if (!config.compression) config.compression = { enabled: false, level: 1, keepRecent: 10, earlyMsgMaxChars: 4000 };
         const lvl = parseInt(process.env.COMPRESSION_LEVEL);
         if (lvl >= 1 && lvl <= 3) config.compression.level = lvl as 1 | 2 | 3;
     }
