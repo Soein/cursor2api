@@ -1196,8 +1196,18 @@ async function preprocessImages(messages: AnthropicMessage[]): Promise<void> {
                             if (!existsSync(resolvedPath)) {
                                 throw new Error(`File not found: ${resolvedPath}`);
                             }
-                            const fileBuffer = readFileSync(resolvedPath);
                             const mediaType = guessMediaType(resolvedPath);
+                            // ★ SVG 是矢量图格式（XML），无法被 OCR 或 Vision API 处理
+                            //   tesseract.js 处理 SVG 会抛出 unhandled error 导致进程崩溃
+                            if (mediaType === 'image/svg+xml') {
+                                console.log(`[Converter] ⚠️ 跳过 SVG 矢量图（不支持 OCR/Vision）: ${resolvedPath}`);
+                                msg.content[i] = {
+                                    type: 'text',
+                                    text: `[SVG vector image attached: ${resolvedPath.substring(resolvedPath.lastIndexOf('/') + 1)}. SVG images are XML-based vector graphics and cannot be processed by OCR/Vision. The image likely contains a logo, icon, badge, or diagram.]`,
+                                } as any;
+                                continue;
+                            }
+                            const fileBuffer = readFileSync(resolvedPath);
                             const base64Data = fileBuffer.toString('base64');
                             msg.content[i] = {
                                 ...block,
@@ -1228,6 +1238,16 @@ async function preprocessImages(messages: AnthropicMessage[]): Promise<void> {
                             const buffer = Buffer.from(await response.arrayBuffer());
                             const contentType = response.headers.get('content-type') || 'image/jpeg';
                             const mediaType = contentType.split(';')[0].trim();
+                            // ★ SVG 是矢量图格式（XML），无法被 OCR 或 Vision API 处理
+                            //   tesseract.js 处理 SVG 会抛出 unhandled error 导致进程崩溃（#69）
+                            if (mediaType === 'image/svg+xml' || imageUrl.toLowerCase().endsWith('.svg')) {
+                                console.log(`[Converter] ⚠️ 跳过 SVG 矢量图（不支持 OCR/Vision）: ${imageUrl.substring(0, 100)}`);
+                                msg.content[i] = {
+                                    type: 'text',
+                                    text: `[SVG vector image from URL: ${imageUrl}. SVG images are XML-based vector graphics and cannot be processed by OCR/Vision. The image likely contains a logo, icon, badge, or diagram.]`,
+                                } as any;
+                                continue;
+                            }
                             const base64Data = buffer.toString('base64');
                             // 替换为 base64 格式
                             msg.content[i] = {
