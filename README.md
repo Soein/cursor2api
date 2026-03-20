@@ -1,8 +1,8 @@
-# Cursor2API v2.7.5
+# Cursor2API v2.7.6
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
-> ⚠️ **版本说明**：当前 v2.7.5 新增常量集中管理、自定义拒绝规则、响应清洗开关，代码可维护性大幅提升。
+> ⚠️ **版本说明**：当前 v2.7.6 新增工具透传模式（passthrough）、工具禁用模式（disabled）、身份泄漏清洗增强和 `tool_choice=any` 引导优化。
 
 ## 原理
 
@@ -80,9 +80,12 @@ cp config.yaml.example config.yaml
 | `logging.file_enabled` | 日志文件持久化 | `false` |
 | `logging.dir` | 日志存储目录 | `./logs` |
 | `logging.max_days` | 日志保留天数 | `7` |
+| `logging.persist_mode` | 日志落盘模式：`summary` 问答摘要 / `compact` 精简 / `full` 完整 | `summary` |
 | `max_auto_continue` | 截断自动续写次数 (`0`=禁用，交由客户端续写) | `0` |
 | `sanitize_response` | 响应内容清洗开关（替换 Cursor 身份引用为 Claude） | `false` |
 | `refusal_patterns` | 自定义拒绝检测规则列表（追加到内置规则） | 不配置 |
+| `tools.passthrough` | 🆕 透传模式：跳过 few-shot 注入，原始 JSON 嵌入（Roo Code/Cline 推荐） | `false` |
+| `tools.disabled` | 🆕 禁用模式：完全不注入工具定义，极致省上下文 | `false` |
 
 > 💡 详细配置说明请参见 `config.yaml.example` 中的注释。
 
@@ -135,6 +138,8 @@ OPENAI_BASE_URL=http://localhost:3010/v1
 - **阶段耗时** - 可视化时间线展示各阶段耗时（receive → convert → send → response → complete）
 - **🌙 日/夜主题** - 一键切换明暗主题，自动记忆偏好
 - **日志持久化** - 配置 `logging.file_enabled: true` 后日志写入 JSONL 文件，重启自动加载
+- **摘要落盘（默认）** - `logging.persist_mode: summary` 仅保留“用户问题 + 模型回答”与少量元数据，体积最小
+- **精简落盘** - `logging.persist_mode: compact` 保留更多排障字段，同时压缩磁盘 JSONL
 
 ### 鉴权
 
@@ -247,6 +252,8 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | `LOG_DIR` | 日志文件目录 |
 | `MAX_AUTO_CONTINUE` | 截断自动续写次数 (`0`=禁用) |
 | `SANITIZE_RESPONSE` | 响应内容清洗开关 (`true`/`false`，默认 `false`) |
+| `TOOLS_PASSTHROUGH` | 🆕 工具透传模式 (`true`/`false`，默认 `false`) |
+| `TOOLS_DISABLED` | 🆕 工具禁用模式 (`true`/`false`，默认 `false`) |
 
 ## 免责声明 / Disclaimer
 
