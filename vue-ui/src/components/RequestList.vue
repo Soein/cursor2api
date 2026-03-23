@@ -69,12 +69,19 @@
           <span v-if="req.retryCount > 0" class="bg bg-retry">R:{{ req.retryCount }}</span>
           <span v-if="req.continuationCount > 0" class="bg bg-cont">+{{ req.continuationCount }}</span>
           <span v-if="req.thinkingChars > 0" class="bg bg-think">🤔 {{ fmtN(req.thinkingChars) }} chars</span>
+          <span v-if="req.status === 'degraded'" class="bg bg-deg">DEGRADED</span>
           <span v-if="req.status === 'error'" class="bg bg-err">ERR</span>
           <span v-if="req.status === 'intercepted'" class="bg bg-int">INTERCEPT</span>
         </div>
         <div class="rdbar-bg"><div class="rdbar" :style="durStyle(req)" /></div>
         <div v-if="req.error" class="rerr">{{ req.error }}</div>
       </div>
+    </div>
+    <!-- 加载更多（仅 SQLite 模式下有数据时显示） -->
+    <div v-if="logsStore.hasMore" class="load-more">
+      <button class="lm-btn" :disabled="logsStore.loadingMore" @click="logsStore.loadMoreRequests()">
+        {{ logsStore.loadingMore ? '加载中...' : `加载更多（已显示 ${logsStore.reqs.length} / ${logsStore.total}）` }}
+      </button>
     </div>
   </div>
 </template>
@@ -129,21 +136,13 @@ const timeTabs = [
 const statusTabs = [
   { value: 'all' as const,         label: '全部' },
   { value: 'success' as const,     label: '成功' },
+  { value: 'degraded' as const,    label: '降级' },
   { value: 'error' as const,       label: '错误' },
   { value: 'processing' as const,  label: '处理中' },
   { value: 'intercepted' as const, label: '中断' },
 ];
 
-const counts = computed(() => {
-  const base = logsStore.reqs;
-  return {
-    all: base.length,
-    success: base.filter(r => r.status === 'success').length,
-    error: base.filter(r => r.status === 'error').length,
-    processing: base.filter(r => r.status === 'processing').length,
-    intercepted: base.filter(r => r.status === 'intercepted').length,
-  };
-});
+const counts = computed(() => logsStore.statusCounts);
 
 function fmtDate(ts: number): string {
   const d = new Date(ts);
@@ -274,6 +273,7 @@ function selectReq(id: string) {
   background: var(--text-muted);
 }
 .st.success { background: var(--green); }
+.st.degraded { background: var(--orange); }
 .st.error { background: var(--red); }
 .st.processing { background: var(--yellow); animation: pulse 1s infinite; }
 .st.intercepted { background: var(--pink); }
@@ -325,6 +325,7 @@ function selectReq(id: string) {
 .bg-retry { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); }
 .bg-cont { background: color-mix(in srgb, var(--purple) 15%, transparent); color: var(--purple); }
 .bg-think { background: color-mix(in srgb, var(--text-muted) 15%, transparent); color: var(--text-muted); }
+.bg-deg { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
 .bg-err { background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red); }
 .bg-int { background: color-mix(in srgb, var(--pink) 15%, transparent); color: var(--pink); }
 
@@ -344,4 +345,8 @@ function selectReq(id: string) {
 @keyframes prog { 0%,100%{opacity:.4} 50%{opacity:1} }
 
 .rerr { color: var(--red); margin-top: 3px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-more { padding: 8px; text-align: center; }
+.lm-btn { width: 100%; padding: 6px 0; font-size: 12px; color: var(--text-muted); background: var(--bg-2); border: 1px solid var(--border-faint); border-radius: 4px; cursor: pointer; }
+.lm-btn:hover:not(:disabled) { background: var(--bg-3); color: var(--text); }
+.lm-btn:disabled { opacity: 0.5; cursor: default; }
 </style>
