@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:stealth": "node stealth-proxy/index.js & STEALTH_PROXY=http://127.0.0.1:3011 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "test:handler-truncation": "node test/unit-handler-truncation.mjs",
