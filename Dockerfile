@@ -5,8 +5,9 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 
 # 仅拷贝包配置并安装所有依赖项（利用 Docker 缓存层）
+# --ignore-scripts 跳过 postinstall（stealth-proxy 在 runner 阶段显式处理）
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # 拷贝项目源代码并执行 TypeScript 编译
 COPY tsconfig.json ./
@@ -33,8 +34,9 @@ RUN groupadd --system --gid 1001 nodejs && \
     useradd --system --uid 1001 --gid nodejs cursor
 
 # ── cursor2api 主服务依赖 ──
+# --ignore-scripts 跳过 postinstall（stealth-proxy 由下方步骤显式安装）
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev \
+RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
 
 # 从 builder 阶段拷贝编译后的产物
