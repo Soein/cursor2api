@@ -91,6 +91,14 @@ export interface CursorPart {
 export interface CursorSSEEvent {
     type: string;
     delta?: string;
+    finishReason?: string;
+    messageMetadata?: {
+        usage?: {
+            inputTokens?: number;
+            outputTokens?: number;
+            totalTokens?: number;
+        };
+    };
 }
 
 // ==================== Internal Types ====================
@@ -106,6 +114,9 @@ export interface AppConfig {
     proxy?: string;
     cursorModel: string;
     authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
+    maxAutoContinue: number;        // 自动续写最大次数，默认 3，设 0 禁用
+    maxHistoryMessages: number;     // 历史消息条数硬限制，默认 -1（不限制）
+    maxHistoryTokens: number;       // 历史消息 token 数上限（tiktoken 估算我们发出的内容，代码自动加 Cursor 后端开销：1300 基础 + perTool*工具数），默认 150000，-1 不限制
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';
@@ -127,13 +138,26 @@ export interface AppConfig {
         file_enabled: boolean;     // 是否启用日志文件持久化
         dir: string;               // 日志文件存储目录
         max_days: number;          // 日志保留天数
+        persist_mode: 'compact' | 'full' | 'summary'; // 落盘模式: compact=精简, full=完整, summary=仅问答摘要
+        db_enabled: boolean;       // 是否启用 SQLite 存储
+        db_path: string;           // SQLite 文件路径，默认 './logs/cursor2api.db'
     };
     tools?: {
         schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式
         descriptionMaxLength: number;                     // 描述截断长度 (0=不截断)
         includeOnly?: string[];                           // 白名单：只保留的工具名
         exclude?: string[];                               // 黑名单：要排除的工具名
+        passthrough?: boolean;                            // 透传模式：跳过 few-shot 注入，直接嵌入工具定义
+        disabled?: boolean;                               // 禁用模式：完全不注入工具定义，最大化节省上下文
+        adaptiveBudget?: boolean;                         // 自适应历史预算：根据工具数量自动收紧历史 token 预算
+        smartTruncation?: boolean;                        // 智能截断：按工具类型差异化截断结果（Read/Bash/Search 各用不同策略）
     };
+    sanitizeEnabled: boolean;    // 是否启用响应内容清洗（替换 Cursor 身份引用为 Claude），默认 false
+    contextPressure?: number;    // 上下文压力膨胀系数（默认 1.35），虚增 input_tokens 让客户端提前压缩
+    refusalPatterns?: string[];  // 自定义拒绝检测规则（追加到内置列表之后）
+    systemPrompt?: string;     // 自定义系统提示词，覆盖 Cursor 内置的文档助手身份
+    cookie?: string;           // Cursor 请求携带的 Cookie（用于通过 Vercel 安全验证）
+    stealthProxy?: string;     // Stealth 代理地址（如 http://stealth-proxy:3011），配置后通过无头浏览器转发请求
     fingerprint: {
         userAgent: string;
     };
